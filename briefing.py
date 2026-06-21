@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Morning Briefing – baut taeglich ein Nachrichten-Briefing aus RSS-Feeds,
-erzeugt eine deutsche MP3 (edge-tts) und schickt Push + MP3 an ntfy.sh.
+erzeugt eine deutsche MP3 (edge-tts) und schickt Push + MP3 + HTML an ntfy.sh.
 
 Laeuft komplett in der Cloud (GitHub Actions) – der Mac muss NICHT laufen.
 
-Italienische Meldungen werden fuer Audio und Push automatisch ins Deutsche
-uebersetzt, damit die Vorlesestimme nicht zwischen den Sprachen springt.
-Die HTML-Seite und die Originallinks bleiben in der Originalsprache.
+Audio und Push sind IMMER auf Deutsch: italienische Meldungen werden uebersetzt;
+schlaegt eine Uebersetzung fehl, wird die Meldung lieber weggelassen als falsch
+auf Italienisch vorgelesen. Die HTML-Seite zeigt die Originalsprache + Quelle.
 """
 
 import os
@@ -24,7 +24,6 @@ from email.utils import parsedate_to_datetime
 # CONFIG
 # ----------------------------------------------------------------------------
 
-# ntfy-Topic (kann auch per Umgebungsvariable NTFY_TOPIC ueberschrieben werden)
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "ute-briefing-501218"
 NTFY_BASE = "https://ntfy.sh"
 
@@ -34,10 +33,7 @@ TTS_VOICE = os.environ.get("TTS_VOICE", "de-DE-ConradNeural")
 # Italienische Meldungen fuer Audio/Push nach Deutsch uebersetzen? (1 = ja)
 TRANSLATE_IT = os.environ.get("TRANSLATE_IT", "1") == "1"
 
-# Nur Meldungen der letzten N Stunden
 MAX_AGE_HOURS = 24
-
-# Pro Rubrik so viele Meldungen
 PER_SECTION_MIN = 3
 PER_SECTION_MAX = 5
 
@@ -58,11 +54,6 @@ ITALIAN_SOURCES = {
     "La Nazione Firenze", "FirenzeToday", "Corriere Fiorentino",
 }
 
-# RSS-Quellen. "scope" steuert, in welche Rubriken ein Feed einsortiert wird:
-#   "national" -> wird per Stichworten auf Wirtschaft/Tech/AI/Politik/Boerse verteilt
-#   "florenz"  -> Rubrik 6
-#   "bodensee" -> Rubrik 7
-# Nicht erreichbare Feeds werden uebersprungen und unten im Briefing vermerkt.
 FEEDS = [
     # --- National Italien ---
     ("Il Sole 24 Ore", "https://www.ilsole24ore.com/rss/economia.xml", "national"),
@@ -96,8 +87,6 @@ FEEDS = [
     ("Newstral Langenargen", "https://newstral.com/de/rss/search?q=Langenargen", "bodensee"),
 ]
 
-# Stichworte zur Einsortierung nationaler Meldungen.
-# Reihenfolge = Prioritaet: das erste passende Bucket gewinnt (AI vor Tech usw.).
 KEYWORDS = [
     ("ai", [
         "ki ", " ki", "k.i.", "kuenstliche intelligenz", "künstliche intelligenz",
@@ -133,7 +122,6 @@ KEYWORDS = [
 # ----------------------------------------------------------------------------
 
 def clean_text(s):
-    """HTML-Tags raus, Entities aufloesen, Whitespace normalisieren."""
     if not s:
         return ""
     s = re.sub(r"<[^>]+>", " ", s)
@@ -150,7 +138,6 @@ def normalize_title(t):
 
 
 def categorize(title, summary):
-    """Liefert den Rubrik-Key fuer eine nationale Meldung (oder None)."""
     text = " " + normalize_title(title + " " + (summary or "")) + " "
     for key, words in KEYWORDS:
         for w in words:
@@ -160,7 +147,6 @@ def categorize(title, summary):
 
 
 def is_duplicate(title, seen_titles):
-    """Einfache Dublettenpruefung ueber Titel-Aehnlichkeit."""
     n = normalize_title(title)
     if not n:
         return True
@@ -176,7 +162,6 @@ def is_duplicate(title, seen_titles):
 
 
 def entry_datetime(entry):
-    """Bestes verfuegbares Datum eines Feed-Eintrags als aware datetime (UTC)."""
     for attr in ("published_parsed", "updated_parsed"):
         val = getattr(entry, attr, None) or (entry.get(attr) if hasattr(entry, "get") else None)
         if val:
@@ -197,35 +182,53 @@ def entry_datetime(entry):
     return None
 
 
-# --- Uebersetzung Italienisch -> Deutsch (nur fuer Audio/Push) ---------------
+# --- Uebersetzung Italienisch -> Deutsch (robust, mit Fallback-Engine) -------
 
 _TRANSLATION_CACHE = {}
 
 
 def translate_to_de(text):
-    """Uebersetzt italienischen Text nach Deutsch. Faellt bei Fehler auf das
-    Original zurueck, damit das Briefing nie scheitert."""
+    """Uebersetzt italienischen Text nach Deutsch. Versucht Google (2x), dann
+    MyMemory. Gibt bei komplettem Fehlschlag das Original zurueck."""
     if not text or not TRANSLATE_IT:
         return text
     if text in _TRANSLATION_CACHE:
         return _TRANSLATION_CACHE[text]
     out = text
     try:
-        from deep_translator import GoogleTranslator  # lazy import
-        translated = GoogleTranslator(source="it", target="de").translate(text)
-        if translated:
-            out = translated
+        from deep_translator import GoogleTranslator
+        for _ in range(2):
+            try:
+                r = GoogleTranslator(source="auto", target="de").translate(text)
+                if r and r.strip():
+                    out = r
+                    break
+            except Exception as ex:
+                print("Google-Uebersetzung fehlgeschlagen:", ex)
+        else:
+            try:
+                from deep_translator import MyMemoryTranslator
+                r = MyMemoryTranslator(source="it-IT", target="de-DE").translate(text)
+                if r and r.strip():
+                    out = r
+            except Exception as ex:
+                print("MyMemory-Uebersetzung fehlgeschlagen:", ex)
     except Exception as ex:
-        print("Uebersetzung fehlgeschlagen, nutze Original:", ex)
+        print("Uebersetzungsmodul nicht verfuegbar, nutze Original:", ex)
     _TRANSLATION_CACHE[text] = out
     return out
 
 
-def spoken_title(item):
-    """Titel fuer Audio/Push: italienische Meldungen werden uebersetzt."""
-    if item.get("lang") == "it":
-        return translate_to_de(item["title"])
-    return item["title"]
+def de_text(item):
+    """Deutscher Titel fuer Audio/Push. Deutsche Meldungen unveraendert;
+    italienische werden uebersetzt. Schlaegt die Uebersetzung fehl, wird die
+    Meldung WEGGELASSEN (None) – nie auf Italienisch ausgegeben."""
+    if item.get("lang") != "it":
+        return item["title"]
+    t = translate_to_de(item["title"])
+    if t and t.strip() and t.strip().lower() != item["title"].strip().lower():
+        return t
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -263,7 +266,7 @@ def gather():
             link = e.get("link", "")
             when = entry_datetime(e)
             if when is not None and when < cutoff:
-                continue  # zu alt
+                continue
 
             if scope == "florenz":
                 key = "florenz"
@@ -286,7 +289,6 @@ def gather():
                 "when": when or now,
             })
 
-    # sortieren (neueste zuerst) und kappen
     for key in buckets:
         buckets[key].sort(key=lambda x: x["when"], reverse=True)
         buckets[key] = buckets[key][:PER_SECTION_MAX]
@@ -295,7 +297,6 @@ def gather():
 
 
 def build_top3(buckets):
-    """Drei Zeilen 'Das Wichtigste zuerst' ueber die Rubriken hinweg."""
     top = []
     for key in ("politik", "boerse", "wirtschaft", "ai", "technologie"):
         if buckets.get(key):
@@ -371,20 +372,21 @@ def build_html(buckets, top3, unreachable, datestr):
 def build_speech(buckets, top3, datestr):
     lines = ["Guten Morgen. Hier ist dein Briefing fuer %s." % datestr, "", "Das Wichtigste zuerst."]
     for t in top3:
-        lines.append(spoken_title(t) + ".")
+        s = de_text(t)
+        if s:
+            lines.append(s + ".")
     lines.append("")
     for key, label, _emoji in SECTIONS:
-        items = buckets.get(key, [])
-        if not items:
+        rendered = [s for s in (de_text(it) for it in buckets.get(key, [])) if s]
+        if not rendered:
             continue
-        name = label.split(". ", 1)[1]
-        lines.append(name + ".")
-        for it in items:
-            lines.append(spoken_title(it) + ".")
+        lines.append(label.split(". ", 1)[1] + ".")
+        for s in rendered:
+            lines.append(s + ".")
         lines.append("")
     lines.append("Das war dein Briefing. Einen guten Tag.")
     text = "\n".join(lines)
-    text = re.sub(r"https?://\S+", "", text)  # falls URLs in Titeln stehen
+    text = re.sub(r"https?://\S+", "", text)
     return text
 
 
@@ -399,32 +401,44 @@ def make_mp3(text, path):
 
 
 # ----------------------------------------------------------------------------
-# ZUSTELLUNG: ntfy (Handy-optimierte Push, durchgehend Deutsch)
+# ZUSTELLUNG: ntfy (Push spiegelt die Briefing-Struktur, durchgehend Deutsch)
 # ----------------------------------------------------------------------------
 
 def build_push(buckets, top3, datestr):
-    parts = ["☕ **Das Wichtigste zuerst**"]
-    for i, t in enumerate(top3, 1):
-        parts.append("%d. %s" % (i, spoken_title(t)))
-    parts.append("")
-    parts.append("➖➖➖")
+    parts = ["☕ **Morning Briefing**", "_%s_" % datestr, "", "**⭐ Das Wichtigste zuerst**"]
+    n = 0
+    for t in top3:
+        s = de_text(t)
+        if s:
+            n += 1
+            parts.append("%d. %s" % (n, s))
     for key, label, emoji in SECTIONS:
-        items = buckets.get(key, [])
-        if not items:
+        rendered = [s for s in (de_text(it) for it in buckets.get(key, [])) if s]
+        if not rendered:
             continue
         name = label.split(". ", 1)[1]
         parts.append("")
         parts.append("%s **%s**" % (emoji, name))
-        parts.append(spoken_title(items[0]))
+        for s in rendered:
+            parts.append("• " + s)
     return "\n".join(parts).strip()
 
 
-def send_ntfy(push_text, mp3_path, datestr_short):
+def _put_attachment(topic_url, path, filename, title, tags):
+    import requests
+    with open(path, "rb") as fh:
+        r = requests.put(topic_url, data=fh,
+                         headers={"Filename": filename, "Title": title, "Tags": tags},
+                         timeout=120)
+    r.raise_for_status()
+    print("Anhang gesendet:", filename, r.status_code)
+
+
+def send_ntfy(push_text, mp3_path, html_path, datestr_short):
     import requests  # lazy import
 
     topic_url = "%s/%s" % (NTFY_BASE, NTFY_TOPIC)
     headers = {
-        # Emoji im Titel-Header ist nicht ASCII-sicher -> Kaffee/Zeitung kommen ueber Tags
         "Title": "Morning Briefing %s" % datestr_short,
         "Tags": "newspaper,coffee",
         "Priority": "default",
@@ -434,16 +448,15 @@ def send_ntfy(push_text, mp3_path, datestr_short):
     r.raise_for_status()
     print("Push gesendet:", r.status_code)
 
-    # MP3 als Anhang an dasselbe Topic
+    # Vollstaendige HTML-Seite zum Antippen (zeigt exakt die Drive-Ansicht)
+    if html_path and os.path.exists(html_path):
+        _put_attachment(topic_url, html_path, "briefing.html",
+                        "📄 Briefing oeffnen %s" % datestr_short, "page_facing_up")
+
+    # MP3 zum Anhoeren
     if mp3_path and os.path.exists(mp3_path):
-        with open(mp3_path, "rb") as fh:
-            r2 = requests.put(topic_url, data=fh,
-                              headers={"Filename": "briefing_audio.mp3",
-                                       "Title": "Audio-Briefing %s" % datestr_short,
-                                       "Tags": "loud_sound"},
-                              timeout=120)
-        r2.raise_for_status()
-        print("MP3 angehaengt:", r2.status_code)
+        _put_attachment(topic_url, mp3_path, "briefing_audio.mp3",
+                        "🔊 Audio-Briefing %s" % datestr_short, "loud_sound")
 
 
 # ----------------------------------------------------------------------------
@@ -465,7 +478,6 @@ def main():
 
     top3 = build_top3(buckets)
 
-    # Feste Dateinamen -> werden bei jedem Lauf ueberschrieben (kein Archiv).
     outdir = os.environ.get("OUT_DIR", "briefings")
     os.makedirs(outdir, exist_ok=True)
     html_path = os.path.join(outdir, "briefing.html")
@@ -487,7 +499,7 @@ def main():
         print("SKIP_NTFY=1 -> keine Zustellung (Testmodus).")
     else:
         try:
-            send_ntfy(build_push(buckets, top3, datestr), mp3_path, datestr_short)
+            send_ntfy(build_push(buckets, top3, datestr), mp3_path, html_path, datestr_short)
         except Exception as ex:
             print("ntfy-Zustellung fehlgeschlagen:", ex)
             sys.exit(1)
