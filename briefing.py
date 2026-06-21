@@ -406,25 +406,10 @@ def make_mp3(text, path):
 # ZUSTELLUNG: ntfy (Push spiegelt die Briefing-Struktur, durchgehend Deutsch)
 # ----------------------------------------------------------------------------
 
-def push_line(item):
-    """Eine Meldungs-Zeile fuer die Push: deutscher Titel + tappbare Links
-    (Original + Claude-Rueckfrage). Italienische ohne Uebersetzung -> None."""
-    s = de_text(item)
-    if not s:
-        return None
-    links = []
-    if item.get("link"):
-        links.append("[Quelle](%s)" % item["link"])
-    q = urllib.parse.quote(
-        'Ich habe im Morning Briefing diese Meldung gelesen: "%s" (Quelle: %s). '
-        'Bitte gib mir Hintergrund und Kontext dazu und beantworte meine Rueckfragen.'
-        % (s, item.get("source", ""))
-    )
-    links.append("[🤖 Claude fragen](https://claude.ai/new?q=%s)" % q)
-    return "• %s\n%s" % (s, " · ".join(links))
-
-
 def build_push(buckets, top3, datestr):
+    """Kompakte Push (klein genug fuer ntfy): Top-3 + je Rubrik die wichtigste
+    Schlagzeile. Quellen + Claude-Buttons stecken in der verlinkten HTML-Seite,
+    die beim Tippen auf die Benachrichtigung aufgeht (Click-Header)."""
     parts = ["☕ **Morning Briefing**", "_%s_" % datestr, "", "**⭐ Das Wichtigste zuerst**"]
     n = 0
     for t in top3:
@@ -433,13 +418,13 @@ def build_push(buckets, top3, datestr):
             n += 1
             parts.append("%d. %s" % (n, s))
     for key, label, emoji in SECTIONS:
-        lines = [ln for ln in (push_line(it) for it in buckets.get(key, [])) if ln]
-        if not lines:
+        rendered = [s for s in (de_text(it) for it in buckets.get(key, [])) if s]
+        if not rendered:
             continue
         name = label.split(". ", 1)[1]
         parts.append("")
         parts.append("%s **%s**" % (emoji, name))
-        parts.extend(lines)
+        parts.append(rendered[0])
     return "\n".join(parts).strip()
 
 
@@ -469,10 +454,13 @@ def send_ntfy(push_text, mp3_path, datestr_short, click_url=None):
     r.raise_for_status()
     print("Push gesendet:", r.status_code)
 
-    # MP3 zum Anhoeren
+    # MP3 zum Anhoeren (Fehler hier soll den Lauf nicht abbrechen)
     if mp3_path and os.path.exists(mp3_path):
-        _put_attachment(topic_url, mp3_path, "briefing_audio.mp3",
-                        "🔊 Audio-Briefing %s" % datestr_short, "loud_sound")
+        try:
+            _put_attachment(topic_url, mp3_path, "briefing_audio.mp3",
+                            "🔊 Audio-Briefing %s" % datestr_short, "loud_sound")
+        except Exception as ex:
+            print("MP3-Anhang fehlgeschlagen (uebersprungen):", ex)
 
 
 # ----------------------------------------------------------------------------
