@@ -24,7 +24,9 @@ from email.utils import parsedate_to_datetime
 # CONFIG
 # ----------------------------------------------------------------------------
 
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "ute-briefing-501218"
+# Oeffentliches Repo: das echte Topic kommt aus dem GitHub-Secret NTFY_TOPIC,
+# damit es nicht im oeffentlichen Code steht. Platzhalter als Fallback.
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "DEIN-NTFY-TOPIC"
 NTFY_BASE = "https://ntfy.sh"
 
 # Vorlesestimme (deutsch, neuronal). Andere: de-DE-KatjaNeural (weiblich)
@@ -404,6 +406,24 @@ def make_mp3(text, path):
 # ZUSTELLUNG: ntfy (Push spiegelt die Briefing-Struktur, durchgehend Deutsch)
 # ----------------------------------------------------------------------------
 
+def push_line(item):
+    """Eine Meldungs-Zeile fuer die Push: deutscher Titel + tappbare Links
+    (Original + Claude-Rueckfrage). Italienische ohne Uebersetzung -> None."""
+    s = de_text(item)
+    if not s:
+        return None
+    links = []
+    if item.get("link"):
+        links.append("[Quelle](%s)" % item["link"])
+    q = urllib.parse.quote(
+        'Ich habe im Morning Briefing diese Meldung gelesen: "%s" (Quelle: %s). '
+        'Bitte gib mir Hintergrund und Kontext dazu und beantworte meine Rueckfragen.'
+        % (s, item.get("source", ""))
+    )
+    links.append("[🤖 Claude fragen](https://claude.ai/new?q=%s)" % q)
+    return "• %s\n%s" % (s, " · ".join(links))
+
+
 def build_push(buckets, top3, datestr):
     parts = ["☕ **Morning Briefing**", "_%s_" % datestr, "", "**⭐ Das Wichtigste zuerst**"]
     n = 0
@@ -413,14 +433,13 @@ def build_push(buckets, top3, datestr):
             n += 1
             parts.append("%d. %s" % (n, s))
     for key, label, emoji in SECTIONS:
-        rendered = [s for s in (de_text(it) for it in buckets.get(key, [])) if s]
-        if not rendered:
+        lines = [ln for ln in (push_line(it) for it in buckets.get(key, [])) if ln]
+        if not lines:
             continue
         name = label.split(". ", 1)[1]
         parts.append("")
         parts.append("%s **%s**" % (emoji, name))
-        for s in rendered:
-            parts.append("• " + s)
+        parts.extend(lines)
     return "\n".join(parts).strip()
 
 
@@ -434,7 +453,7 @@ def _put_attachment(topic_url, path, filename, title, tags):
     print("Anhang gesendet:", filename, r.status_code)
 
 
-def send_ntfy(push_text, mp3_path, html_path, datestr_short):
+def send_ntfy(push_text, mp3_path, datestr_short, click_url=None):
     import requests  # lazy import
 
     topic_url = "%s/%s" % (NTFY_BASE, NTFY_TOPIC)
@@ -444,14 +463,11 @@ def send_ntfy(push_text, mp3_path, html_path, datestr_short):
         "Priority": "default",
         "Markdown": "yes",
     }
+    if click_url:
+        headers["Click"] = click_url  # Tippen auf die Benachrichtigung oeffnet die Seite
     r = requests.post(topic_url, data=push_text.encode("utf-8"), headers=headers, timeout=30)
     r.raise_for_status()
     print("Push gesendet:", r.status_code)
-
-    # Vollstaendige HTML-Seite zum Antippen (zeigt exakt die Drive-Ansicht)
-    if html_path and os.path.exists(html_path):
-        _put_attachment(topic_url, html_path, "briefing.html",
-                        "📄 Briefing oeffnen %s" % datestr_short, "page_facing_up")
 
     # MP3 zum Anhoeren
     if mp3_path and os.path.exists(mp3_path):
@@ -464,6 +480,10 @@ def send_ntfy(push_text, mp3_path, html_path, datestr_short):
 # ----------------------------------------------------------------------------
 
 def main():
+    # PHASE: "all" (lokal: bauen + senden), "build" (nur Dateien), "send" (nur Push).
+    # In GitHub Actions: erst "build", dann Pages-Deploy, dann "send" mit CLICK_URL.
+    phase = os.environ.get("PHASE", "all")
+
     now_local = dt.datetime.now()
     datestr = now_local.strftime("%A, %d.%m.%Y").replace("Monday", "Montag")\
         .replace("Tuesday", "Dienstag").replace("Wednesday", "Mittwoch")\
@@ -471,35 +491,47 @@ def main():
         .replace("Saturday", "Samstag").replace("Sunday", "Sonntag")
     datestr_short = now_local.strftime("%d.%m.")
 
-    print("Sammle Feeds ...")
-    buckets, unreachable = gather()
-    total = sum(len(v) for v in buckets.values())
-    print("Meldungen gesamt:", total, "| nicht erreichbar:", len(unreachable))
-
-    top3 = build_top3(buckets)
-
     outdir = os.environ.get("OUT_DIR", "briefings")
     os.makedirs(outdir, exist_ok=True)
     html_path = os.path.join(outdir, "briefing.html")
     mp3_path = os.path.join(outdir, "briefing.mp3")
+    push_path = os.path.join(outdir, "push.md")
 
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(build_html(buckets, top3, unreachable, datestr))
-    print("HTML geschrieben:", html_path)
+    push_text = None
 
-    try:
-        speech = build_speech(buckets, top3, datestr)
-        make_mp3(speech, mp3_path)
-        print("MP3 geschrieben:", mp3_path)
-    except Exception as ex:
-        print("MP3-Erzeugung fehlgeschlagen:", ex)
-        mp3_path = None
+    if phase in ("all", "build"):
+        print("Sammle Feeds ...")
+        buckets, unreachable = gather()
+        total = sum(len(v) for v in buckets.values())
+        print("Meldungen gesamt:", total, "| nicht erreichbar:", len(unreachable))
+        top3 = build_top3(buckets)
 
-    if os.environ.get("SKIP_NTFY") == "1":
-        print("SKIP_NTFY=1 -> keine Zustellung (Testmodus).")
-    else:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(build_html(buckets, top3, unreachable, datestr))
+        print("HTML geschrieben:", html_path)
+
         try:
-            send_ntfy(build_push(buckets, top3, datestr), mp3_path, html_path, datestr_short)
+            make_mp3(build_speech(buckets, top3, datestr), mp3_path)
+            print("MP3 geschrieben:", mp3_path)
+        except Exception as ex:
+            print("MP3-Erzeugung fehlgeschlagen:", ex)
+
+        push_text = build_push(buckets, top3, datestr)
+        with open(push_path, "w", encoding="utf-8") as f:
+            f.write(push_text)
+        print("Build fertig.")
+
+    if phase in ("all", "send"):
+        if os.environ.get("SKIP_NTFY") == "1":
+            print("SKIP_NTFY=1 -> keine Zustellung (Testmodus).")
+            return
+        if push_text is None:
+            with open(push_path, "r", encoding="utf-8") as f:
+                push_text = f.read()
+        the_mp3 = mp3_path if os.path.exists(mp3_path) else None
+        click_url = os.environ.get("CLICK_URL") or None
+        try:
+            send_ntfy(push_text, the_mp3, datestr_short, click_url)
         except Exception as ex:
             print("ntfy-Zustellung fehlgeschlagen:", ex)
             sys.exit(1)
