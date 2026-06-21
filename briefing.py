@@ -6,8 +6,9 @@ erzeugt eine deutsche MP3 (edge-tts) und schickt Push + MP3 an ntfy.sh.
 
 Laeuft komplett in der Cloud (GitHub Actions) – der Mac muss NICHT laufen.
 
-Konfiguration: siehe Abschnitt CONFIG weiter unten. Die einzige Sache, die
-du normalerweise anpasst, ist NTFY_TOPIC (oder per Umgebungsvariable setzen).
+Italienische Meldungen werden fuer Audio und Push automatisch ins Deutsche
+uebersetzt, damit die Vorlesestimme nicht zwischen den Sprachen springt.
+Die HTML-Seite und die Originallinks bleiben in der Originalsprache.
 """
 
 import os
@@ -30,6 +31,9 @@ NTFY_BASE = "https://ntfy.sh"
 # Vorlesestimme (deutsch, neuronal). Andere: de-DE-KatjaNeural (weiblich)
 TTS_VOICE = os.environ.get("TTS_VOICE", "de-DE-ConradNeural")
 
+# Italienische Meldungen fuer Audio/Push nach Deutsch uebersetzen? (1 = ja)
+TRANSLATE_IT = os.environ.get("TRANSLATE_IT", "1") == "1"
+
 # Nur Meldungen der letzten N Stunden
 MAX_AGE_HOURS = 24
 
@@ -37,16 +41,22 @@ MAX_AGE_HOURS = 24
 PER_SECTION_MIN = 3
 PER_SECTION_MAX = 5
 
-# Rubriken in fester Reihenfolge
+# Rubriken in fester Reihenfolge: key, Anzeigename, Emoji (fuer die Handy-Push)
 SECTIONS = [
-    ("wirtschaft", "1. Wirtschaft"),
-    ("technologie", "2. Technologie"),
-    ("ai", "3. AI"),
-    ("politik", "4. Politik"),
-    ("boerse", "5. Boerse & Maerkte"),
-    ("florenz", "6. Lokal Florenz"),
-    ("langenargen", "7. Lokal Langenargen / Bodensee"),
+    ("wirtschaft", "1. Wirtschaft", "📊"),
+    ("technologie", "2. Technologie", "💻"),
+    ("ai", "3. AI", "🤖"),
+    ("politik", "4. Politik", "🏛️"),
+    ("boerse", "5. Boerse & Maerkte", "📈"),
+    ("florenz", "6. Lokal Florenz", "🏖️"),
+    ("langenargen", "7. Lokal Langenargen / Bodensee", "🌊"),
 ]
+
+# Italienische Quellen -> deren Meldungen werden fuer Audio/Push uebersetzt.
+ITALIAN_SOURCES = {
+    "Il Sole 24 Ore", "Corriere della Sera", "La Repubblica",
+    "La Nazione Firenze", "FirenzeToday", "Corriere Fiorentino",
+}
 
 # RSS-Quellen. "scope" steuert, in welche Rubriken ein Feed einsortiert wird:
 #   "national" -> wird per Stichworten auf Wirtschaft/Tech/AI/Politik/Boerse verteilt
@@ -119,7 +129,7 @@ KEYWORDS = [
 
 
 # ----------------------------------------------------------------------------
-# HILFSFUNKTIONEN (ohne externe Imports -> gut testbar)
+# HILFSFUNKTIONEN
 # ----------------------------------------------------------------------------
 
 def clean_text(s):
@@ -187,6 +197,37 @@ def entry_datetime(entry):
     return None
 
 
+# --- Uebersetzung Italienisch -> Deutsch (nur fuer Audio/Push) ---------------
+
+_TRANSLATION_CACHE = {}
+
+
+def translate_to_de(text):
+    """Uebersetzt italienischen Text nach Deutsch. Faellt bei Fehler auf das
+    Original zurueck, damit das Briefing nie scheitert."""
+    if not text or not TRANSLATE_IT:
+        return text
+    if text in _TRANSLATION_CACHE:
+        return _TRANSLATION_CACHE[text]
+    out = text
+    try:
+        from deep_translator import GoogleTranslator  # lazy import
+        translated = GoogleTranslator(source="it", target="de").translate(text)
+        if translated:
+            out = translated
+    except Exception as ex:
+        print("Uebersetzung fehlgeschlagen, nutze Original:", ex)
+    _TRANSLATION_CACHE[text] = out
+    return out
+
+
+def spoken_title(item):
+    """Titel fuer Audio/Push: italienische Meldungen werden uebersetzt."""
+    if item.get("lang") == "it":
+        return translate_to_de(item["title"])
+    return item["title"]
+
+
 # ----------------------------------------------------------------------------
 # FEEDS EINLESEN
 # ----------------------------------------------------------------------------
@@ -197,8 +238,8 @@ def gather():
     now = dt.datetime.now(dt.timezone.utc)
     cutoff = now - dt.timedelta(hours=MAX_AGE_HOURS)
 
-    buckets = {key: [] for key, _ in SECTIONS}
-    seen = {key: [] for key, _ in SECTIONS}
+    buckets = {key: [] for key, _, _ in SECTIONS}
+    seen = {key: [] for key, _, _ in SECTIONS}
     unreachable = []
 
     for source, url, scope in FEEDS:
@@ -241,6 +282,7 @@ def gather():
                 "summary": summary,
                 "link": link,
                 "source": source,
+                "lang": "it" if source in ITALIAN_SOURCES else "de",
                 "when": when or now,
             })
 
@@ -261,7 +303,7 @@ def build_top3(buckets):
         if len(top) == 3:
             break
     if len(top) < 3:
-        for key, _ in SECTIONS:
+        for key, _, _ in SECTIONS:
             for item in buckets.get(key, []):
                 if item not in top:
                     top.append(item)
@@ -273,7 +315,7 @@ def build_top3(buckets):
 
 
 # ----------------------------------------------------------------------------
-# AUSGABE: HTML
+# AUSGABE: HTML (Originalsprache, mit Claude-Knopf)
 # ----------------------------------------------------------------------------
 
 def build_html(buckets, top3, unreachable, datestr):
@@ -281,7 +323,7 @@ def build_html(buckets, top3, unreachable, datestr):
         return html.escape(s or "")
 
     secs_html = []
-    for key, label in SECTIONS:
+    for key, label, _emoji in SECTIONS:
         items = buckets.get(key, [])
         if not items:
             items_html = '<div class="item"><p style="color:#94a3b8">Keine Meldungen der letzten 24 Stunden.</p></div>'
@@ -316,34 +358,33 @@ def build_html(buckets, top3, unreachable, datestr):
         un_note = "Alle konfigurierten Quellen waren erreichbar."
 
     nav = "\n".join('<a href="#r%s">%s</a>' % (label.split(".")[0], html.escape(label.split(". ")[1].split(" /")[0]))
-                    for _, label in SECTIONS)
+                    for _, label, _ in SECTIONS)
 
     return TEMPLATE.format(datestr=esc(datestr), top=top_html, sections="\n".join(secs_html),
                            nav=nav, unreachable=un_note)
 
 
 # ----------------------------------------------------------------------------
-# AUSGABE: VORLESETEXT + MP3
+# AUSGABE: VORLESETEXT + MP3 (durchgehend Deutsch)
 # ----------------------------------------------------------------------------
 
 def build_speech(buckets, top3, datestr):
     lines = ["Guten Morgen. Hier ist dein Briefing fuer %s." % datestr, "", "Das Wichtigste zuerst."]
     for t in top3:
-        lines.append(t["title"] + ".")
+        lines.append(spoken_title(t) + ".")
     lines.append("")
-    for key, label in SECTIONS:
+    for key, label, _emoji in SECTIONS:
         items = buckets.get(key, [])
         if not items:
             continue
         name = label.split(". ", 1)[1]
         lines.append(name + ".")
         for it in items:
-            lines.append(it["title"] + ".")
+            lines.append(spoken_title(it) + ".")
         lines.append("")
     lines.append("Das war dein Briefing. Einen guten Tag.")
-    # Links/URLs entfernen, falls in Titeln
     text = "\n".join(lines)
-    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"https?://\S+", "", text)  # falls URLs in Titeln stehen
     return text
 
 
@@ -358,25 +399,27 @@ def make_mp3(text, path):
 
 
 # ----------------------------------------------------------------------------
-# ZUSTELLUNG: ntfy
+# ZUSTELLUNG: ntfy (Handy-optimierte Push, durchgehend Deutsch)
 # ----------------------------------------------------------------------------
 
 def build_push(buckets, top3, datestr):
-    parts = ["**Das Wichtigste zuerst**"]
-    for t in top3:
-        parts.append("• " + t["title"])
+    parts = ["☕ **Das Wichtigste zuerst**"]
+    for i, t in enumerate(top3, 1):
+        parts.append("%d. %s" % (i, spoken_title(t)))
     parts.append("")
-    for key, label in SECTIONS:
+    parts.append("➖➖➖")
+    for key, label, emoji in SECTIONS:
         items = buckets.get(key, [])
         if not items:
             continue
         name = label.split(". ", 1)[1]
-        parts.append("**%s**" % name)
-        parts.append(items[0]["title"])
-    return "\n".join(parts)
+        parts.append("")
+        parts.append("%s **%s**" % (emoji, name))
+        parts.append(spoken_title(items[0]))
+    return "\n".join(parts).strip()
 
 
-def send_ntfy(push_text, mp3_path, datestr_short, click_url=None):
+def send_ntfy(push_text, mp3_path, datestr_short):
     import requests  # lazy import
 
     topic_url = "%s/%s" % (NTFY_BASE, NTFY_TOPIC)
@@ -387,8 +430,6 @@ def send_ntfy(push_text, mp3_path, datestr_short, click_url=None):
         "Priority": "default",
         "Markdown": "yes",
     }
-    if click_url:
-        headers["Click"] = click_url
     r = requests.post(topic_url, data=push_text.encode("utf-8"), headers=headers, timeout=30)
     r.raise_for_status()
     print("Push gesendet:", r.status_code)
@@ -410,13 +451,12 @@ def send_ntfy(push_text, mp3_path, datestr_short, click_url=None):
 # ----------------------------------------------------------------------------
 
 def main():
-    now_local = dt.datetime.now()  # Runner-Zeit; Datum reicht fuer die Anzeige
+    now_local = dt.datetime.now()
     datestr = now_local.strftime("%A, %d.%m.%Y").replace("Monday", "Montag")\
         .replace("Tuesday", "Dienstag").replace("Wednesday", "Mittwoch")\
         .replace("Thursday", "Donnerstag").replace("Friday", "Freitag")\
         .replace("Saturday", "Samstag").replace("Sunday", "Sonntag")
     datestr_short = now_local.strftime("%d.%m.")
-    isodate = now_local.strftime("%Y-%m-%d")
 
     print("Sammle Feeds ...")
     buckets, unreachable = gather()
@@ -425,16 +465,16 @@ def main():
 
     top3 = build_top3(buckets)
 
+    # Feste Dateinamen -> werden bei jedem Lauf ueberschrieben (kein Archiv).
     outdir = os.environ.get("OUT_DIR", "briefings")
     os.makedirs(outdir, exist_ok=True)
-    html_path = os.path.join(outdir, "briefing_%s.html" % isodate)
-    mp3_path = os.path.join(outdir, "briefing_%s.mp3" % isodate)
+    html_path = os.path.join(outdir, "briefing.html")
+    mp3_path = os.path.join(outdir, "briefing.mp3")
 
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(build_html(buckets, top3, unreachable, datestr))
     print("HTML geschrieben:", html_path)
 
-    # MP3
     try:
         speech = build_speech(buckets, top3, datestr)
         make_mp3(speech, mp3_path)
@@ -443,19 +483,11 @@ def main():
         print("MP3-Erzeugung fehlgeschlagen:", ex)
         mp3_path = None
 
-    # Click-Link auf die archivierte HTML im Repo (falls in Actions)
-    click_url = None
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    ref = os.environ.get("GITHUB_REF_NAME", "main")
-    if repo:
-        click_url = "https://raw.githubusercontent.com/%s/%s/%s" % (repo, ref, html_path)
-
-    # Push
     if os.environ.get("SKIP_NTFY") == "1":
         print("SKIP_NTFY=1 -> keine Zustellung (Testmodus).")
     else:
         try:
-            send_ntfy(build_push(buckets, top3, datestr), mp3_path, datestr_short, click_url)
+            send_ntfy(build_push(buckets, top3, datestr), mp3_path, datestr_short)
         except Exception as ex:
             print("ntfy-Zustellung fehlgeschlagen:", ex)
             sys.exit(1)
@@ -502,7 +534,7 @@ footer{{margin:30px 14px 0;padding:16px;background:#fff;border:1px solid #e7ebf2
 <main>
 <div class="top"><h2>Das Wichtigste zuerst</h2><ol>{top}</ol></div>
 {sections}
-<footer><b>Automatisch erstellt</b> aus RSS-Feeds (Il Sole 24 Ore, Corriere, Repubblica, Handelsblatt, FAZ, SZ, La Nazione, FirenzeToday, Schwäbische, Südkurier u. a.). {unreachable} Bitte vor geschäftlichen Entscheidungen am Original prüfen.</footer>
+<footer><b>Automatisch erstellt</b> aus RSS-Feeds (Il Sole 24 Ore, Corriere, Repubblica, Handelsblatt, FAZ, SZ, La Nazione, FirenzeToday, Schwäbische, Südkurier u. a.). {unreachable} Italienische Meldungen werden fuer Audio/Push ins Deutsche uebersetzt. Bitte vor geschäftlichen Entscheidungen am Original prüfen.</footer>
 </main></div></body></html>"""
 
 
