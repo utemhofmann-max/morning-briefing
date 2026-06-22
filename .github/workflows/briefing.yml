@@ -2,7 +2,7 @@ name: Morning Briefing
 
 on:
   schedule:
-    - cron: "30 4 * * *"   # ~06:30 Uhr DE (Sommerzeit); im Winter 05:30
+    - cron: "37 4 * * *"   # ~06:37 Uhr DE (Sommerzeit); im Winter 05:37
   workflow_dispatch: {}
 
 permissions:
