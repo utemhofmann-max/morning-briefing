@@ -68,4 +68,7 @@ jobs:
     permissions:
       actions: write
     steps:
-      - uses: gautamkrishnar/keepalive-workflow@v2
+      - name: Zeitplan aktiv halten
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/briefing.yml/enable"
