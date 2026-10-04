@@ -9,6 +9,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: write   # fuer Keepalive
 
 jobs:
   briefing:
@@ -60,3 +61,11 @@ jobs:
           PHASE: send
           CLICK_URL: ${{ steps.deploy.outputs.page_url }}
         run: python briefing.py
+
+  keepalive:
+    # Verhindert, dass GitHub den Zeitplan nach 60 Tagen ohne Repo-Aktivitaet abschaltet
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: gautamkrishnar/keepalive-workflow@v2
